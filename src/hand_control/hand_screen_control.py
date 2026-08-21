@@ -1,11 +1,15 @@
 """
 hand_screen_control.py
 --------------------------
+顔検出は使わず、片手のトラッキングだけに全振りして画面を操作する。
+
 できること:
     1) 人差し指の先でマウスカーソルを移動
-    2) 親指と人差し指をつまむ(ピンチ)で クリック / ドラッグ
-    3) パーを出して左右に振る で スライド送り(左右矢印キー)
-    4) ピースサインで 音量ミュート切り替え
+    2) パー→グー でドラッグ開始、グー→パー でドロップ
+    3) 親指と人差し指をつまんで すぐ離す → クリック
+       つまんだまま少しキープしてから離す → ダブルクリック
+    4) パーを出したまま左右に振る → スライド送り(左右矢印キー)
+    5) ピースサイン → 音量ミュート切り替え
 
 必要なライブラリ:
     uv add mediapipe opencv-python numpy pyautogui
@@ -21,6 +25,8 @@ hand_screen_control.py
 注意:
     - pyautoguiにはフェイルセーフ機能があり、カーソルを画面の左上端(0,0)に
       移動させると強制的に例外を投げて安全停止できます(暴走時の緊急停止用)。
+    - 実際に画面操作を始めると、他の操作がしにくくなるので、
+      慣れるまではカメラ映像ウィンドウを画面の隅に置いて動作確認しながら使うのがおすすめです。
 """
 
 import time
@@ -50,18 +56,14 @@ FRAME_MARGIN = 0.15      # カメラ映像の外側何%を「操作エリア外�
 # 親指-人差し指の距離(手のサイズに対する比率)がこれを下回ったら「つまんだ」と判定。
 # ENTER(つかみ始め)の方を厳しく、EXIT(離す)の方を緩くすることで、
 # 閾値ギリギリでのチカチカ(誤ON/OFF)を防ぐ(ヒステリシス)。
-# 親指-人差し指の距離(手のサイズに対する比率)がこれを下回ったら「つまんだ」と判定。
-# ENTER(つかみ始め)の方を厳しく、EXIT(離す)の方を緩くすることで、
-# 閾値ギリギリでのチカチカ(誤ON/OFF)を防ぐ(ヒステリシス)。
 PINCH_ENTER_RATIO = 0.23
 PINCH_EXIT_RATIO = 0.26
 
-# ピンチ後、指がこの距離(スクリーン座標のピクセル数)以上動いたら「ドラッグ」とみなす。
-# それ未満で指を離した場合は「クリック」として扱う。
-DRAG_MOVE_THRESHOLD_PX = 50
+# ピンチをこの秒数以上キープしてから離すと「ダブルクリック」、それ未満なら「クリック」。
+LONG_PINCH_SECONDS = 0.4
 
 # ジェスチャーショートカットまわり
-SWIPE_COOLDOWN_SECONDS = 0.8
+SWIPE_COOLDOWN_SECONDS = 0.5
 SWIPE_DISTANCE_THRESHOLD = 0.15  # 手首のx移動量(正規化座標)がこれを超えたらスワイプ判定
 PEACE_COOLDOWN_SECONDS = 1.0
 
@@ -73,7 +75,6 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0  # moveTo等のたびに勝手に待たされるのを防ぐ(こちらでフレームレート制御する)
 
 SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
-
 
 
 def _distance(a, b):
@@ -137,11 +138,28 @@ def main():
         return
 
     smoothed_x, smoothed_y = None, None
-    pinch_state = "idle"  # "idle" -> "pending"(つまんだ直後、まだクリックかドラッグか未確定) -> "dragging"
-    pinch_start_pos = None
+    pending_grab = False   # パーだった実績があり、まだグーで確定していない(中間状態も含む)
+    is_dragging = False
+    drag_offset = (0.0, 0.0)  # ドラッグ開始時の「人差し指カーソル位置」と「手のひら中心位置」のズレ
+
+    pinch_active = False
+    pinch_start_time = None
+
     last_wrist_x = None
     last_swipe_time = 0.0
     last_peace_time = 0.0
+
+    def finish_pinch():
+        """ピンチが終了した瞬間に呼ぶ。キープ時間に応じてクリック/ダブルクリックを発行する"""
+        nonlocal pinch_active, pinch_start_time
+        if pinch_start_time is not None:
+            duration = time.time() - pinch_start_time
+            if duration >= LONG_PINCH_SECONDS:
+                pyautogui.doubleClick()
+            else:
+                pyautogui.click()
+        pinch_active = False
+        pinch_start_time = None
 
     print("ハンドコントロールを開始します。'q' または ESC で終了。")
     print(f"画面解像度: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
@@ -164,10 +182,55 @@ def main():
                 landmarks = result.hand_landmarks[0]
                 h, w, _ = frame.shape
 
-                # --- 1) カーソル移動(人差し指の先を使用、EMAで平滑化) ---
-                index_tip = landmarks[INDEX_TIP]
-                target_x, target_y = map_to_screen(index_tip.x, index_tip.y)
+                finger_states = get_finger_states(landmarks)
+                # 親指(0番目)は角度のブレが大きいので、パー/グー判定は
+                # 人差し指・中指・薬指・小指(1〜4番目)だけで見る
+                four_fingers = finger_states[1:5]
+                is_open = all(four_fingers)
+                is_fist = not any(four_fingers)
 
+                palm_x, palm_y = map_to_screen(
+                    landmarks[MIDDLE_MCP].x, landmarks[MIDDLE_MCP].y
+                )
+
+                # --- 1) パー→グー でドラッグ開始 / グー→パー でドロップ ---
+                # 「パー」「ドラッグ確定後のグー」以外の中間的な手の形の間は、
+                # カーソル座標(target_x/y)を更新しない = カーソルを凍結する。
+                # こうしないと、指を閉じていく途中の物理的な動きにカーソルが
+                # つられてズレてしまう。
+                target_x, target_y = smoothed_x, smoothed_y  # デフォルトは「凍結」(前回位置のまま)
+
+                if is_open:
+                    if is_dragging:
+                        pyautogui.mouseUp()
+                        is_dragging = False
+                    pending_grab = True
+                    index_tip = landmarks[INDEX_TIP]
+                    target_x, target_y = map_to_screen(index_tip.x, index_tip.y)
+
+                elif is_fist:
+                    if pending_grab and not is_dragging:
+                        # つかんだ瞬間:今のカーソル位置(人差し指基準)と
+                        # 手のひら中心位置とのズレを記録しておく(切り替え時のワープ防止)
+                        drag_offset = (smoothed_x - palm_x, smoothed_y - palm_y) \
+                            if smoothed_x is not None else (0.0, 0.0)
+                        pyautogui.mouseDown()
+                        is_dragging = True
+                    pending_grab = False
+                    if is_dragging:
+                        target_x = palm_x + drag_offset[0]
+                        target_y = palm_y + drag_offset[1]
+                    # is_dragging が False(パーを経ずに突然グーにした等)ならカーソルは凍結のまま
+
+                else:
+                    # 開ききっても閉じきってもいない中間状態
+                    if is_dragging:
+                        # ドラッグ中に多少グーが緩んでも(検出のブレ)、ドラッグ自体は継続する
+                        target_x = palm_x + drag_offset[0]
+                        target_y = palm_y + drag_offset[1]
+                    # ドラッグ中でなければ pending_grab は維持したままカーソルは凍結
+
+                # --- 2) カーソル移動(凍結時は target が smoothed と同じなので実質何もしない) ---
                 if smoothed_x is None:
                     smoothed_x, smoothed_y = target_x, target_y
                 else:
@@ -180,38 +243,18 @@ def main():
                     print("フェイルセーフが作動しました(カーソルが画面隅へ)。停止します。")
                     break
 
-                # --- 2) ピンチでクリック/ドラッグ ---
-                # つまんだ直後は "pending"(保留)状態にし、まだOS側にmouseDownを送らない。
-                # そこから指が一定距離(DRAG_MOVE_THRESHOLD_PX)動いたら初めて
-                # "dragging" に昇格してmouseDownを送る。動かないまま離せば単発クリック。
+                # --- 3) ピンチでクリック/ダブルクリック ---
                 pinch_ratio = get_pinch_ratio(landmarks)
+                if not pinch_active and pinch_ratio < PINCH_ENTER_RATIO:
+                    pinch_active = True
+                    pinch_start_time = time.time()
+                elif pinch_active and pinch_ratio > PINCH_EXIT_RATIO:
+                    finish_pinch()
 
-                if pinch_state == "idle" and pinch_ratio < PINCH_ENTER_RATIO:
-                    pinch_state = "pending"
-                    pinch_start_pos = (smoothed_x, smoothed_y)
-
-                elif pinch_state == "pending":
-                    moved = ((smoothed_x - pinch_start_pos[0]) ** 2 +
-                             (smoothed_y - pinch_start_pos[1]) ** 2) ** 0.5
-                    if pinch_ratio > PINCH_EXIT_RATIO:
-                        # 大きく動かないまま離した → クリックとして扱う
-                        pyautogui.click()
-                        pinch_state = "idle"
-                    elif moved > DRAG_MOVE_THRESHOLD_PX:
-                        # 一定以上動いた → ここからドラッグ開始
-                        pyautogui.mouseDown()
-                        pinch_state = "dragging"
-
-                elif pinch_state == "dragging":
-                    if pinch_ratio > PINCH_EXIT_RATIO:
-                        pyautogui.mouseUp()
-                        pinch_state = "idle"
-
-                finger_states = get_finger_states(landmarks)
                 now = time.time()
 
-                # --- 3) パー(全部伸びている)を左右に振ったらスライド送り ---
-                if all(finger_states):
+                # --- 4) パー(全部伸びている)を左右に振ったらスライド送り ---
+                if is_open:
                     wrist_x = landmarks[WRIST].x
                     if last_wrist_x is not None and now - last_swipe_time > SWIPE_COOLDOWN_SECONDS:
                         delta = wrist_x - last_wrist_x
@@ -227,7 +270,7 @@ def main():
                 else:
                     last_wrist_x = None
 
-                # --- 4) ピース(人差し指+中指だけ)で音量ミュート切り替え ---
+                # --- 5) ピース(人差し指+中指だけ)で音量ミュート切り替え ---
                 if finger_states == [False, True, True, False, False]:
                     if now - last_peace_time > PEACE_COOLDOWN_SECONDS:
                         pyautogui.press("volumemute")
@@ -237,21 +280,19 @@ def main():
                 # --- デバッグ用オーバーレイ ---
                 for lm in landmarks:
                     cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 3, (0, 255, 255), -1)
-                status = pinch_state.upper() if pinch_state != "idle" else ""
+                status = "DRAGGING" if is_dragging else ("PINCH" if pinch_active else "")
                 cv2.putText(frame, status, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 cv2.putText(frame, f"pinch_ratio: {pinch_ratio:.2f}", (10, 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             else:
                 smoothed_x, smoothed_y = None, None
-                # 手の検出が一瞬途切れたタイミング(指を離す瞬間はよく起きる)でも、
-                # それまでの状態に応じて後始末をしてから idle に戻す。
-                # "pending" のまま黙って idle に戻すと、離した瞬間のクリックが
-                # 握りつぶされてしまうため、ここで代わりにクリックを発行する。
-                if pinch_state == "pending":
-                    pyautogui.click()
-                elif pinch_state == "dragging":
+                pending_grab = False
+                # 手の検出が一瞬途切れても、進行中だった操作はきちんと後始末する
+                if pinch_active:
+                    finish_pinch()
+                if is_dragging:
                     pyautogui.mouseUp()
-                pinch_state = "idle"
+                    is_dragging = False
 
             cv2.imshow("Hand Control (camera)", frame)
             key = cv2.waitKey(1) & 0xFF
@@ -259,7 +300,7 @@ def main():
                 break
 
     finally:
-        if pinch_state == "dragging":
+        if is_dragging:
             pyautogui.mouseUp()
         landmarker.close()
         cap.release()

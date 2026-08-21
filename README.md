@@ -14,8 +14,7 @@ MediaPipe Tasks API + OpenCV + pyautogui を使用。
 ### インストール
 
 ```powershell
-uv python pin 3.12
-uv add mediapipe opencv-python numpy pyautogui
+uv sync
 ```
 
 
